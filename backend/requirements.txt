@@ -1,0 +1,7 @@
+Flask==3.0.0
+flask-cors==4.0.0
+llama-cpp-python==0.2.90
+requests==2.31.0
+werkzeug==3.0.1
+pymongo==4.6.1
+python-dotenv==1.0.0
