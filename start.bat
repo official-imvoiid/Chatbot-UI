@@ -1,11 +1,9 @@
 @echo off
 color 0A
-
 echo =========================================
 echo    Chatbot UI - Starting Application
 echo =========================================
 echo.
-
 REM Check if Python is installed
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -13,7 +11,6 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
 REM Check if Node is installed
 node --version >nul 2>&1
 if errorlevel 1 (
@@ -21,19 +18,12 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
 REM Reminder for MongoDB
 echo Reminder: Ensure MongoDB is running on port 27017
 echo.
-
-REM Create necessary directories
-if not exist "backend\uploads" mkdir backend\uploads
-if not exist "backend\models" mkdir backend\models
-
 REM Start Backend
 echo Starting Flask Backend...
 cd backend
-
 REM Create virtual environment if it doesn't exist
 if not exist "venv" (
     echo Creating virtual environment...
@@ -44,6 +34,8 @@ if not exist "venv" (
         exit /b 1
     )
     call venv\Scripts\activate.bat
+    echo Upgrading pip...
+    python -m pip install --upgrade pip
     echo Installing Python dependencies...
     pip install -r requirements.txt
     if errorlevel 1 (
@@ -54,22 +46,17 @@ if not exist "venv" (
 ) else (
     call venv\Scripts\activate.bat
 )
-
 REM Start Flask in new window
 start "Flask Backend" cmd /k "cd /d %CD% && venv\Scripts\activate.bat && python app.py"
 echo Backend started on http://localhost:5001
 echo.
-
 REM Wait a bit for backend to start
 timeout /t 3 /nobreak >nul
-
 REM Go back to root
 cd ..
-
 REM Start Frontend
 echo Starting React Frontend...
 cd public
-
 REM Install npm dependencies if needed
 if not exist "node_modules" (
     echo Installing npm dependencies...
@@ -80,15 +67,12 @@ if not exist "node_modules" (
         exit /b 1
     )
 )
-
 REM Start React dev server in new window
 start "React Frontend" cmd /k "cd /d %CD% && npm run dev"
 echo Frontend starting on http://localhost:5173
 echo.
-
 REM Go back to root
 cd ..
-
 echo.
 echo =========================================
 echo   Application Started Successfully!
@@ -97,4 +81,4 @@ echo.
 echo Frontend: http://localhost:5173
 echo Backend:  http://localhost:5001
 echo.
-end
+pause

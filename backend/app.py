@@ -11,6 +11,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 import re
+import gc
 
 # Try to import llama_cpp but make it optional
 try:
@@ -27,16 +28,16 @@ app = Flask(__name__)
 # CORS to allow frontend connection
 CORS(app, origins=["http://localhost:5173", "http://127.0.0.1:5173"], supports_credentials=True)
 
-UPLOAD_FOLDER = 'uploads'
 MODEL_FOLDER = 'models'
+UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'gguf', 'txt'}
 MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(MODEL_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MODEL_FOLDER'] = MODEL_FOLDER
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
@@ -137,6 +138,33 @@ def get_windows_safe_path(filename):
         safe_name = name[:255-len(ext)] + ext
     return safe_name
 
+def validate_gguf_file(filepath):
+    """Validate if a file is a proper GGUF file"""
+    try:
+        with open(filepath, 'rb') as f:
+            # Read GGUF magic number (first 4 bytes should be 'GGUF')
+            magic = f.read(4)
+            if magic != b'GGUF':
+                return False, "Not a valid GGUF file (invalid magic number)"
+            
+            # Read version (next 4 bytes)
+            version_bytes = f.read(4)
+            if len(version_bytes) != 4:
+                return False, "Corrupted GGUF file (incomplete header)"
+            
+            version = int.from_bytes(version_bytes, byteorder='little')
+            
+            # Check file size
+            file_size = os.path.getsize(filepath)
+            if file_size < 1024:  # Less than 1KB is definitely wrong
+                return False, f"File too small ({file_size} bytes)"
+            
+            return True, f"Valid GGUF v{version} file ({file_size / (1024**3):.2f} GB)"
+    except Exception as e:
+        return False, f"Error reading file: {str(e)}"
+
+# ==================== AUTH ROUTES ====================
+
 @app.route('/api/auth/signup', methods=['POST'])
 def signup():
     if db is None:
@@ -225,6 +253,8 @@ def profile():
             return jsonify({'error': 'User not found or no changes'}), 404
         return jsonify({'message': 'Profile updated successfully'}), 200
 
+# ==================== MODEL ROUTES ====================
+
 @app.route('/api/model/upload', methods=['POST'])
 def upload_model():
     if 'file' not in request.files:
@@ -251,32 +281,61 @@ def upload_model():
     os.makedirs(model_folder, exist_ok=True)
     
     try:
-        # Check if file already exists and handle accordingly
+        # If file exists, skip upload and just return success
         if os.path.exists(filepath):
-            # Option 1: Return error asking user to unload first
-            return jsonify({
-                'error': f'Model {safe_filename} already exists. Please unload the current model first or rename your file.',
-                'filename': safe_filename
-            }), 400
+            file_size = os.path.getsize(filepath)
             
-            # Option 2: Create unique filename (uncomment if you prefer this approach)
-            # name, ext = os.path.splitext(safe_filename)
-            # counter = 1
-            # while os.path.exists(filepath):
-            #     safe_filename = f"{name}_{counter}{ext}"
-            #     filepath = os.path.normpath(os.path.join(model_folder, safe_filename))
-            #     counter += 1
+            # Verify it's a valid file (not empty)
+            if file_size == 0:
+                os.remove(filepath)  # Clean up corrupted file
+            else:
+                # Validate GGUF file
+                is_valid, msg = validate_gguf_file(filepath)
+                if not is_valid:
+                    return jsonify({'error': f'Invalid GGUF file: {msg}'}), 400
+                
+                # File already exists and is valid
+                if db is not None:
+                    model_doc = {
+                        'filename': safe_filename,
+                        'filepath': filepath,
+                        'size': file_size,
+                        'uploaded_at': datetime.utcnow()
+                    }
+                    models_collection.update_one(
+                        {'filename': safe_filename},
+                        {'$set': model_doc},
+                        upsert=True
+                    )
+                
+                return jsonify({
+                    'message': 'Model already exists',
+                    'filename': safe_filename,
+                    'path': filepath,
+                    'size': file_size,
+                    'validation': msg
+                }), 200
         
+        # File doesn't exist, proceed with upload
+        print(f"Saving model to: {filepath}")
         file.save(filepath)
         
-        # Verify file was saved and is a valid GGUF file
+        # Verify file was saved
         if not os.path.exists(filepath):
             return jsonify({'error': 'Failed to save model file'}), 500
             
         file_size = os.path.getsize(filepath)
         if file_size == 0:
-            os.remove(filepath)  # Clean up empty file
+            os.remove(filepath)
             return jsonify({'error': 'Uploaded file is empty'}), 400
+        
+        # Validate GGUF file
+        is_valid, validation_msg = validate_gguf_file(filepath)
+        if not is_valid:
+            os.remove(filepath)  # Remove invalid file
+            return jsonify({'error': f'Invalid GGUF file: {validation_msg}'}), 400
+        
+        print(f"✓ Model validated: {validation_msg}")
         
         if db is not None:
             model_doc = {
@@ -295,7 +354,8 @@ def upload_model():
             'message': 'Model uploaded successfully',
             'filename': safe_filename,
             'path': filepath,
-            'size': file_size
+            'size': file_size,
+            'validation': validation_msg
         }), 200
         
     except Exception as e:
@@ -314,7 +374,7 @@ def load_model():
     global current_model, current_model_name
     
     if not LLAMA_AVAILABLE:
-        return jsonify({'error': 'llama-cpp-python is not installed. Please install it to use GGUF models.'}), 500
+        return jsonify({'error': 'llama-cpp-python is not installed. Install it with: pip install llama-cpp-python'}), 500
     
     data = request.json
     model_name = data.get('model_name')
@@ -324,37 +384,136 @@ def load_model():
     if not model_name:
         return jsonify({'error': 'Model name required'}), 400
     
-    model_path = os.path.join(app.config['MODEL_FOLDER'], model_name)
+    # Use the same path handling as upload for consistency
+    safe_model_name = get_windows_safe_path(model_name)
+    model_folder = os.path.abspath(app.config['MODEL_FOLDER'])
+    model_path = os.path.normpath(os.path.join(model_folder, safe_model_name))
     
+    print(f"\n{'='*60}")
+    print(f"MODEL LOADING ATTEMPT")
+    print(f"{'='*60}")
+    print(f"Requested model: {model_name}")
+    print(f"Safe model name: {safe_model_name}")
+    print(f"Model folder: {model_folder}")
+    print(f"Full model path: {model_path}")
+    
+    # Security check
+    if not model_path.startswith(os.path.abspath(model_folder)):
+        return jsonify({'error': 'Invalid model path'}), 400
+    
+    # Check if file exists
     if not os.path.exists(model_path):
-        return jsonify({'error': f'Model not found at {model_path}'}), 404
+        available_models = [f for f in os.listdir(model_folder) if f.endswith('.gguf')]
+        error_msg = f'Model not found at: {model_path}'
+        if available_models:
+            error_msg += f'\n\nAvailable models:\n' + '\n'.join(f'  - {m}' for m in available_models)
+        print(f"❌ {error_msg}")
+        return jsonify({'error': error_msg}), 404
+    
+    # Validate it's a file
+    if not os.path.isfile(model_path):
+        return jsonify({'error': f'{model_path} is not a file'}), 400
+    
+    # Validate GGUF file
+    is_valid, validation_msg = validate_gguf_file(model_path)
+    print(f"File validation: {validation_msg}")
+    
+    if not is_valid:
+        return jsonify({
+            'error': f'Invalid GGUF file: {validation_msg}',
+            'suggestion': 'The file may be corrupted. Try re-downloading or re-uploading the model.'
+        }), 400
     
     try:
+        # Unload current model
         if current_model:
-            del current_model
+            print(f"Unloading previous model: {current_model_name}")
+            try:
+                del current_model
+            except:
+                pass
             current_model = None
+            current_model_name = None
+            gc.collect()
+            time.sleep(0.5)
         
-        print(f"Loading model: {model_name}")
-        print(f"Model path: {model_path}")
+        print(f"\nModel Info:")
+        print(f"  Size: {os.path.getsize(model_path) / (1024**3):.2f} GB")
+        print(f"  Context: {n_ctx}")
+        print(f"  GPU Layers: {n_gpu_layers}")
+        print(f"\nLoading model with llama-cpp-python...")
         
-        current_model = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            verbose=True,
-            use_mlock=False,
-            use_mmap=True
-        )
+        # Try loading with user settings
+        try:
+            current_model = Llama(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_gpu_layers=n_gpu_layers,
+                verbose=True,
+                use_mlock=False,
+                use_mmap=True,
+                n_threads=4
+            )
+            print("✓ Model loaded with requested settings")
+            
+        except Exception as load_error:
+            # If loading fails, try with conservative settings
+            print(f"⚠️  Initial load failed: {str(load_error)[:100]}...")
+            print("Retrying with conservative settings (CPU only, reduced context)...")
+            
+            try:
+                current_model = Llama(
+                    model_path=model_path,
+                    n_ctx=min(n_ctx, 512),  # Drastically reduce context
+                    n_gpu_layers=0,  # No GPU
+                    verbose=True,
+                    use_mlock=False,
+                    use_mmap=True,
+                    n_threads=2
+                )
+                n_ctx = min(n_ctx, 512)
+                n_gpu_layers = 0
+                print("✓ Model loaded with conservative settings")
+                
+            except Exception as retry_error:
+                # If still fails, provide detailed error
+                error_detail = str(retry_error)
+                print(f"❌ Failed to load even with conservative settings: {error_detail}")
+                
+                # Provide specific guidance
+                suggestions = []
+                if "out of memory" in error_detail.lower() or "memory" in error_detail.lower():
+                    suggestions.append("Insufficient RAM. Close other applications or use a smaller model.")
+                if "incompatible" in error_detail.lower():
+                    suggestions.append("GGUF version incompatible. Update llama-cpp-python: pip install llama-cpp-python --upgrade")
+                if "cannot open" in error_detail.lower() or "dll" in error_detail.lower():
+                    suggestions.append("Missing dependencies. Reinstall: pip install llama-cpp-python --force-reinstall")
+                if not suggestions:
+                    suggestions.append("Try updating llama-cpp-python or use a different model format")
+                
+                return jsonify({
+                    'error': f'Failed to load model: {error_detail}',
+                    'suggestions': suggestions,
+                    'model_path': model_path
+                }), 500
         
-        current_model_name = model_name
+        current_model_name = safe_model_name
         
-        print("Testing model with simple prompt...")
-        test_response = current_model("Hello", max_tokens=10)
-        print(f"Model test successful: {test_response}")
+        # Test the model
+        print("\nTesting model generation...")
+        try:
+            test_response = current_model("Hello", max_tokens=5, temperature=0.1)
+            test_text = test_response['choices'][0]['text'] if 'choices' in test_response else str(test_response)
+            test_text = clean_llama_response(test_text)
+            print(f"✓ Model test successful: '{test_text}'")
+        except Exception as test_error:
+            print(f"⚠️  Model loaded but test failed: {test_error}")
+            test_text = "Model loaded (test generation failed)"
         
+        # Update database
         if db is not None:
             models_collection.update_one(
-                {'filename': model_name},
+                {'filename': safe_model_name},
                 {'$set': {
                     'last_loaded': datetime.utcnow(),
                     'n_ctx': n_ctx,
@@ -363,25 +522,68 @@ def load_model():
                 upsert=True
             )
         
+        print(f"\n{'='*60}")
+        print("✓ MODEL LOADED SUCCESSFULLY")
+        print(f"{'='*60}\n")
+        
         return jsonify({
             'message': 'Model loaded successfully',
-            'model_name': model_name,
+            'model_name': safe_model_name,
+            'model_path': model_path,
             'n_ctx': n_ctx,
-            'test_response': test_response
+            'n_gpu_layers': n_gpu_layers,
+            'validation': validation_msg,
+            'test_response': test_text
         }), 200
         
     except Exception as e:
-        error_msg = f'Failed to load model: {str(e)}'
-        print(error_msg)
-        return jsonify({'error': error_msg}), 500
+        error_msg = str(e)
+        print(f"\n{'='*60}")
+        print(f"❌ MODEL LOADING FAILED")
+        print(f"{'='*60}")
+        print(f"Error: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+        
+        # Clean up
+        if current_model:
+            try:
+                del current_model
+            except:
+                pass
+            current_model = None
+            current_model_name = None
+        
+        # Provide helpful error messages
+        suggestions = []
+        if "cannot open shared object file" in error_msg or "DLL load failed" in error_msg:
+            suggestions.append("Install/reinstall llama-cpp-python: pip install llama-cpp-python --force-reinstall --no-cache-dir")
+        elif "out of memory" in error_msg.lower():
+            suggestions.append("Insufficient RAM. Try a smaller model or reduce n_ctx parameter.")
+        elif "incompatible" in error_msg.lower() or "version" in error_msg.lower():
+            suggestions.append("GGUF version incompatible. Update: pip install llama-cpp-python --upgrade")
+        else:
+            suggestions.append("Check that llama-cpp-python is properly installed")
+            suggestions.append("Try: pip install llama-cpp-python --force-reinstall")
+        
+        return jsonify({
+            'error': f'Failed to load model: {error_msg}',
+            'suggestions': suggestions,
+            'model_path': model_path
+        }), 500
 
 @app.route('/api/model/unload', methods=['POST'])
 def unload_model():
     global current_model, current_model_name
     if current_model:
-        del current_model
+        try:
+            del current_model
+        except:
+            pass
         current_model = None
         current_model_name = None
+        gc.collect()
         return jsonify({'message': 'Model unloaded successfully'}), 200
     return jsonify({'message': 'No model loaded'}), 200
 
@@ -389,26 +591,80 @@ def unload_model():
 def model_status():
     return jsonify({
         'loaded': current_model is not None,
-        'model_name': current_model_name
+        'model_name': current_model_name,
+        'llama_available': LLAMA_AVAILABLE
     }), 200
 
 @app.route('/api/model/list', methods=['GET'])
 def list_models():
     models = []
-    for filename in os.listdir(app.config['MODEL_FOLDER']):
+    model_folder = os.path.abspath(app.config['MODEL_FOLDER'])
+    
+    # Ensure folder exists
+    os.makedirs(model_folder, exist_ok=True)
+    
+    for filename in os.listdir(model_folder):
         if filename.endswith('.gguf'):
-            filepath = os.path.join(app.config['MODEL_FOLDER'], filename)
+            filepath = os.path.join(model_folder, filename)
+            
+            # Skip if not a file
+            if not os.path.isfile(filepath):
+                continue
+            
+            # Validate GGUF
+            is_valid, validation_msg = validate_gguf_file(filepath)
+            
             model_info = {
                 'filename': filename,
-                'size': os.path.getsize(filepath)
+                'size': os.path.getsize(filepath),
+                'path': filepath,
+                'is_loaded': filename == current_model_name,
+                'valid': is_valid,
+                'validation_message': validation_msg
             }
+            
             if db is not None:
                 model_doc = models_collection.find_one({'filename': filename})
                 if model_doc:
                     model_info['uploaded_at'] = model_doc.get('uploaded_at')
                     model_info['last_loaded'] = model_doc.get('last_loaded')
+                    model_info['n_ctx'] = model_doc.get('n_ctx')
+                    model_info['n_gpu_layers'] = model_doc.get('n_gpu_layers')
+            
             models.append(model_info)
-    return jsonify({'models': serialize_doc(models)}), 200
+    
+    return jsonify({
+        'models': serialize_doc(models),
+        'current_model': current_model_name,
+        'model_folder': model_folder,
+        'llama_available': LLAMA_AVAILABLE
+    }), 200
+
+@app.route('/api/model/validate', methods=['POST'])
+def validate_model():
+    data = request.json
+    model_name = data.get('model_name')
+    
+    if not model_name:
+        return jsonify({'error': 'Model name required'}), 400
+    
+    safe_model_name = get_windows_safe_path(model_name)
+    model_path = os.path.join(app.config['MODEL_FOLDER'], safe_model_name)
+    
+    if not os.path.exists(model_path):
+        return jsonify({'error': 'Model file not found'}), 404
+    
+    is_valid, message = validate_gguf_file(model_path)
+    
+    return jsonify({
+        'valid': is_valid,
+        'message': message,
+        'file_size': os.path.getsize(model_path),
+        'file_size_gb': f"{os.path.getsize(model_path) / (1024**3):.2f} GB",
+        'file_path': model_path
+    }), 200
+
+# ==================== CHAT ROUTES ====================
 
 @app.route('/api/chat/completions', methods=['POST'])
 def chat_completion():
@@ -438,7 +694,7 @@ def chat_completion():
                 temperature=temperature,
                 top_p=top_p,
                 echo=False,
-                stop=["<|end|>", "<|user|>", "<|assistant|>"]
+                stop=["<|end|>", "<|user|>", "<|assistant|>", "\nUser:", "\nHuman:"]
             )
             
             raw_response = response['choices'][0]['text']
@@ -517,6 +773,8 @@ def chat_completion():
     
     return jsonify({'error': 'Invalid model type'}), 400
 
+# ==================== FILE ROUTES ====================
+
 @app.route('/api/file/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
@@ -559,12 +817,14 @@ def upload_file():
             try:
                 os.remove(filepath)
             except:
-                pass  # Ignore cleanup errors
+                pass
                 
         except Exception as e:
             return jsonify({'error': f'Failed to process file {filename}: {str(e)}'}), 500
     
     return jsonify({'files': uploaded_files}), 200
+
+# ==================== HISTORY ROUTES ====================
 
 @app.route('/api/history/save', methods=['POST'])
 def save_history():
@@ -687,10 +947,11 @@ def clear_history():
         'count': result.deleted_count
     }), 200
 
+# ==================== UTILITY ROUTES ====================
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     mongo_status = 'connected' if db is not None else 'disconnected'
-    model_status = 'loaded' if current_model is not None else 'not loaded'
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
@@ -722,9 +983,11 @@ def get_stats():
     }), 200
 
 if __name__ == '__main__':
-    print("Starting Flask backend server...")
-    print("Make sure you have installed all required packages:")
-    print("pip install flask flask-cors pymongo python-dotenv requests")
-    print("For GGUF models: pip install llama-cpp-python")
-    print("Server will run on: http://localhost:5001")
+    print("\n" + "="*60)
+    print("FLASK BACKEND SERVER")
+    print("="*60)
+    print(f"llama-cpp-python: {'✓ Available' if LLAMA_AVAILABLE else '✗ Not installed'}")
+    print(f"MongoDB: {'✓ Connected' if db is not None else '✗ Not connected'}")
+    print(f"Server URL: http://localhost:5001")
+    print("="*60 + "\n")
     app.run(host='0.0.0.0', port=5001, debug=True)
